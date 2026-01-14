@@ -5,6 +5,7 @@ using Match3.Infrastructure;
 using Match3.Infrastructure.SequenceDetectors;
 using Match3.Core.Structs;
 using Cysharp.Threading.Tasks;
+using System;
 using System.Text;
 using System.Threading;
 
@@ -14,24 +15,25 @@ namespace Match3.App.Demo
     {
         private MyMatch3Game _game;
         private bool _busy;
+        private CancellationToken _lifetimeToken;
         
         [SerializeField] private int rows = 8;
         [SerializeField] private int cols = 8;
         [SerializeField] private float tileSize = 1f;
-        [SerializeField] private int[] itemIds = new[] { 1, 2, 3, 4, 5 };
-        [SerializeField] private Color[] palette = new[]
+        [SerializeField] private ItemVisual[] itemVisuals = new[]
         {
-            new Color(0.95f, 0.25f, 0.25f),
-            new Color(0.20f, 0.55f, 0.95f),
-            new Color(0.25f, 0.85f, 0.35f),
-            new Color(0.95f, 0.85f, 0.20f),
-            new Color(0.75f, 0.30f, 0.95f)
+            new ItemVisual { itemId = 1, color = new Color(0.95f, 0.25f, 0.25f) },
+            new ItemVisual { itemId = 2, color = new Color(0.20f, 0.55f, 0.95f) },
+            new ItemVisual { itemId = 3, color = new Color(0.25f, 0.85f, 0.35f) },
+            new ItemVisual { itemId = 4, color = new Color(0.95f, 0.85f, 0.20f) },
+            new ItemVisual { itemId = 5, color = new Color(0.75f, 0.30f, 0.95f) }
         };
         [SerializeField] private bool autoFitCamera = true;
         [SerializeField] private Transform boardRoot;
         [SerializeField] private GameBoardView boardView;
         [SerializeField] private BoardInputController inputController;
         [SerializeField] private FpsMonitor fpsMonitor;
+        [SerializeField] private BoardDebugOverlay debugOverlay;
         [SerializeField] private Vector2Int debugSwapA = new Vector2Int(0, 0);
         [SerializeField] private Vector2Int debugSwapB = new Vector2Int(0, 1);
 
@@ -42,10 +44,25 @@ namespace Match3.App.Demo
         [SerializeField] private float spawnHeight = 6f;
         [SerializeField] private int maxPerFrame = 32;
         [SerializeField] private int maxChains = 10;
+        [SerializeField] private bool enableValidation = true;
+        [SerializeField] private bool useFixedSeed = true;
+        [SerializeField] private int fixedSeed = 12345;
 
         public bool IsBusy => _busy;
+        public IGameBoard<GameSlot> Board => _game?.Board;
+        public GameBoardView BoardView => boardView;
 
-        void Start()
+        private void Awake()
+        {
+            _lifetimeToken = this.GetCancellationTokenOnDestroy();
+        }
+
+        private void Start()
+        {
+            StartGameAsync().Forget(Debug.LogException);
+        }
+
+        private async UniTask StartGameAsync()
         {
             if (boardRoot == null)
             {
@@ -81,6 +98,15 @@ namespace Match3.App.Demo
                 }
             }
 
+            if (debugOverlay == null)
+            {
+                debugOverlay = GetComponent<BoardDebugOverlay>();
+                if (debugOverlay == null)
+                {
+                    debugOverlay = gameObject.AddComponent<BoardDebugOverlay>();
+                }
+            }
+
             var solver = new GameBoardSolver<GameSlot>(new ISequenceDetector<GameSlot>[]
             {
                 new HorizontalLineDetector<GameSlot>(),
@@ -102,15 +128,31 @@ namespace Match3.App.Demo
             
             _game.InitGameLevel(0);
 
-            var itemsPool = new ArrayItemsPool(itemIds);
-            var fillStrategy = new GravityFillStrategy(itemsPool, boardView, solver, clearDuration, fallDuration, spawnDuration, spawnHeight, maxPerFrame, maxChains);
+            var itemsPool = new ArrayItemsPool(GetItemIds(), useFixedSeed ? fixedSeed : (int?)null);
+            var fillStrategy = new GravityFillStrategy(itemsPool, boardView, solver, clearDuration, fallDuration, spawnDuration, spawnHeight, maxPerFrame, maxChains, enableValidation);
             _game.SetGameBoardFillStrategy(fillStrategy);
 
-            boardView.Build(_game.Board, tileSize, palette, boardRoot, autoFitCamera);
+            boardView.Build(_game.Board, tileSize, itemVisuals, boardRoot, autoFitCamera);
 
-            _game.StartAsync().Forget(Debug.LogException);
-            
+            try
+            {
+                await _game.StartAsync(_lifetimeToken);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
             Debug.Log("Match3 Game Started!");
+
+            if (enableValidation)
+            {
+                var mismatches = boardView.ValidateAndFix();
+                if (mismatches > 0)
+                {
+                    Debug.LogWarning($"BoardView mismatches fixed: {mismatches}");
+                }
+            }
         }
 
         public void TrySwap(int r1, int c1, int r2, int c2)
@@ -133,7 +175,8 @@ namespace Match3.App.Demo
             _busy = true;
             try
             {
-                await _game.SwapItemsAsync(a, b);
+                Match3DebugLog.Record($"Swap {a.RowIndex},{a.ColumnIndex} <-> {b.RowIndex},{b.ColumnIndex}");
+                await _game.SwapItemsAsync(a, b, _lifetimeToken);
             }
             finally
             {
@@ -201,12 +244,12 @@ namespace Match3.App.Demo
             _game = new MyMatch3Game(config);
             _game.InitGameLevel(0);
 
-            var itemsPool = new ArrayItemsPool(itemIds);
-            var fillStrategy = new GravityFillStrategy(itemsPool, boardView, solver, clearDuration, fallDuration, spawnDuration, spawnHeight, maxPerFrame, maxChains);
+            var itemsPool = new ArrayItemsPool(GetItemIds(), useFixedSeed ? fixedSeed : (int?)null);
+            var fillStrategy = new GravityFillStrategy(itemsPool, boardView, solver, clearDuration, fallDuration, spawnDuration, spawnHeight, maxPerFrame, maxChains, enableValidation);
             _game.SetGameBoardFillStrategy(fillStrategy);
 
-            boardView.Build(_game.Board, tileSize, palette, boardRoot, autoFitCamera);
-            await _game.StartAsync();
+            boardView.Build(_game.Board, tileSize, itemVisuals, boardRoot, autoFitCamera);
+            await _game.StartAsync(_lifetimeToken);
         }
 
         public void SetBusy(bool busy)
@@ -269,7 +312,23 @@ namespace Match3.App.Demo
                 return UniTask.CompletedTask;
             }
 
-            return _game.SwapItemsAsync(a, b, ct);
+            var token = ct.CanBeCanceled ? ct : _lifetimeToken;
+            return _game.SwapItemsAsync(a, b, token);
+        }
+
+        private int[] GetItemIds()
+        {
+            if (itemVisuals == null || itemVisuals.Length == 0)
+            {
+                return new[] { 1 };
+            }
+
+            var ids = new int[itemVisuals.Length];
+            for (int i = 0; i < itemVisuals.Length; i++)
+            {
+                ids[i] = itemVisuals[i].itemId;
+            }
+            return ids;
         }
     }
 

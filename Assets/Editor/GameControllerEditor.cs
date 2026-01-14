@@ -29,7 +29,25 @@ public class GameControllerEditor : Editor
             {
                 controller.PrintBoard();
             }
+
+            if (GUILayout.Button("Dump Debug Log"))
+            {
+                Debug.Log(Match3DebugLog.Dump());
+            }
+
+            if (GUILayout.Button("Clear Debug Log"))
+            {
+                Match3DebugLog.Clear();
+            }
+
+            var tester = controller.GetComponent<Match3StabilityTester>();
+            if (tester != null)
+            {
+                if (GUILayout.Button("Run Stability Test"))
+                {
+                    tester.Run();
+                }
+            }
         }
     }
 }
-

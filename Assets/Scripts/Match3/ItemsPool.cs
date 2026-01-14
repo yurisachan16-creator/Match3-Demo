@@ -10,10 +10,10 @@ namespace Match3.App
         private readonly int[] _availableItemIds;
         private readonly System.Random _random;
 
-        public ArrayItemsPool(int[] availableItemIds)
+        public ArrayItemsPool(int[] availableItemIds, int? seed = null)
         {
             _availableItemIds = availableItemIds;
-            _random = new System.Random();
+            _random = seed.HasValue ? new System.Random(seed.Value) : new System.Random();
         }
 
         public int GetRandomItemId()

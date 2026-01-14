@@ -51,7 +51,8 @@ namespace Match3.App.Demo
         private float _tileSize;
         private int _rows;
         private int _cols;
-        private Color[] _palette;
+        private Dictionary<int, Color> _itemColors;
+        private IGameBoard<GameSlot> _board;
 
         private Sprite _sprite;
 
@@ -61,7 +62,7 @@ namespace Match3.App.Demo
         private int _batchDepth;
         private readonly HashSet<GridPosition> _dirtyPositions = new HashSet<GridPosition>();
 
-        public void Build(IGameBoard<GameSlot> board, float tileSize, Color[] palette, Transform root, bool autoFitCamera)
+        public void Build(IGameBoard<GameSlot> board, float tileSize, ItemVisual[] itemVisuals, Transform root, bool autoFitCamera)
         {
             Clear();
 
@@ -69,7 +70,8 @@ namespace Match3.App.Demo
             _tileSize = tileSize <= 0 ? 1f : tileSize;
             _rows = board.RowCount;
             _cols = board.ColumnCount;
-            _palette = palette;
+            _board = board;
+            _itemColors = BuildItemColors(itemVisuals);
             _sprite = CreateDefaultSprite();
 
             _itemPool ??= new SimpleObjectPool<GameObject>(CreateItemGo, ResetPooledGo, initCount: 0);
@@ -108,6 +110,143 @@ namespace Match3.App.Demo
             }
         }
 
+        public int ValidateAndFix(bool rebuildMissingItems = true)
+        {
+            int mismatches = 0;
+
+            var keys = ListPool<GridPosition>.Get();
+            keys.AddRange(_slots.Keys);
+            for (int i = 0; i < keys.Count; i++)
+            {
+                var pos = keys[i];
+                if (_slots.TryGetValue(pos, out var view) == false)
+                {
+                    continue;
+                }
+                var slot = view.Slot;
+                if (slot == null)
+                {
+                    mismatches++;
+                    continue;
+                }
+
+                bool expectedHas = slot.HasItem;
+                if (expectedHas == false)
+                {
+                    if (view.ItemGo != null)
+                    {
+                        _itemPool.Recycle(view.ItemGo);
+                        view.ItemGo = null;
+                        view.ItemRenderer = null;
+                        _slots[pos] = view;
+                        mismatches++;
+                    }
+                    continue;
+                }
+
+                var expectedColor = ItemIdToColor(slot.ItemId, 1f);
+
+                if (view.ItemGo == null)
+                {
+                    if (rebuildMissingItems)
+                    {
+                        SyncSlotVisual(pos, slot, animate: false);
+                        view = _slots[pos];
+                        if (view.ItemGo == null)
+                        {
+                            mismatches++;
+                            continue;
+                        }
+                        view.ItemGo.transform.position = view.AnchorWorld;
+                        view.ItemRenderer.color = expectedColor;
+                        _slots[pos] = view;
+                        mismatches++;
+                        continue;
+                    }
+
+                    mismatches++;
+                    continue;
+                }
+
+                view.ItemGo.transform.position = view.AnchorWorld;
+
+                if (ColorsClose(view.ItemRenderer.color, expectedColor) == false)
+                {
+                    view.ItemRenderer.color = expectedColor;
+                    _slots[pos] = view;
+                    mismatches++;
+                }
+            }
+
+            keys.Release2Pool();
+            return mismatches;
+        }
+
+        public void ForceResyncAll()
+        {
+            var keys = ListPool<GridPosition>.Get();
+            keys.AddRange(_slots.Keys);
+            for (int i = 0; i < keys.Count; i++)
+            {
+                var pos = keys[i];
+                if (_slots.TryGetValue(pos, out var view) == false)
+                {
+                    continue;
+                }
+                if (view.Slot == null)
+                {
+                    continue;
+                }
+
+                SyncSlotVisual(pos, view.Slot, animate: false);
+                if (_slots.TryGetValue(pos, out var refreshed) && refreshed.ItemGo != null)
+                {
+                    refreshed.ItemGo.transform.position = refreshed.AnchorWorld;
+                    _slots[pos] = refreshed;
+                }
+            }
+
+            keys.Release2Pool();
+        }
+
+        public bool TryGetCellDebugInfo(GridPosition pos, out int itemId, out bool hasItem, out bool viewHasItem, out bool colorMatches, out Vector3 world)
+        {
+            itemId = 0;
+            hasItem = false;
+            viewHasItem = false;
+            colorMatches = false;
+            world = default;
+
+            if (_slots.TryGetValue(pos, out var view) == false || view.Slot == null)
+            {
+                return false;
+            }
+
+            world = view.AnchorWorld;
+            hasItem = view.Slot.HasItem;
+            itemId = view.Slot.ItemId;
+            viewHasItem = view.ItemGo != null;
+
+            if (hasItem == false)
+            {
+                colorMatches = viewHasItem == false;
+                return true;
+            }
+
+            if (viewHasItem == false)
+            {
+                colorMatches = false;
+                return true;
+            }
+
+            var expected = ItemIdToColor(itemId, 1f);
+            colorMatches = ColorsClose(view.ItemRenderer.color, expected);
+            return true;
+        }
+
+        public int RowCount => _rows;
+        public int ColumnCount => _cols;
+
         public void Clear()
         {
             foreach (var slot in _subscribedSlots)
@@ -127,6 +266,7 @@ namespace Match3.App.Demo
             _slots.Clear();
             _dirtyPositions.Clear();
             _batchDepth = 0;
+            _board = null;
         }
 
         private void OnDestroy()
@@ -242,6 +382,19 @@ namespace Match3.App.Demo
 
         public async UniTask AnimateSwapAsync(GridPosition a, GridPosition b, float duration, CancellationToken ct = default)
         {
+            var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, this.GetCancellationTokenOnDestroy());
+            try
+            {
+                await AnimateSwapAsyncInternal(a, b, duration, linkedCts.Token);
+            }
+            finally
+            {
+                linkedCts.Dispose();
+            }
+        }
+
+        private async UniTask AnimateSwapAsyncInternal(GridPosition a, GridPosition b, float duration, CancellationToken ct)
+        {
             if (_slots.TryGetValue(a, out var va) == false || _slots.TryGetValue(b, out var vb) == false)
             {
                 return;
@@ -254,12 +407,20 @@ namespace Match3.App.Demo
 
             var goA = va.ItemGo;
             var goB = vb.ItemGo;
+            if (goA == null || goB == null)
+            {
+                return;
+            }
             var startA = goA.transform.position;
             var startB = goB.transform.position;
             float t = 0f;
             while (t < duration)
             {
                 ct.ThrowIfCancellationRequested();
+                if (goA == null || goB == null)
+                {
+                    return;
+                }
                 t += Time.deltaTime;
                 float p = duration <= 0 ? 1f : Mathf.Clamp01(t / duration);
                 goA.transform.position = Vector3.Lerp(startA, startB, p);
@@ -267,6 +428,10 @@ namespace Match3.App.Demo
                 await UniTask.Yield(PlayerLoopTiming.Update, ct);
             }
 
+            if (goA == null || goB == null)
+            {
+                return;
+            }
             goA.transform.position = startB;
             goB.transform.position = startA;
 
@@ -284,6 +449,19 @@ namespace Match3.App.Demo
 
         public async UniTask AnimateClearAsync(IReadOnlyList<GridPosition> positions, float duration, int maxPerFrame, CancellationToken ct = default)
         {
+            var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, this.GetCancellationTokenOnDestroy());
+            try
+            {
+                await AnimateClearAsyncInternal(positions, duration, maxPerFrame, linkedCts.Token);
+            }
+            finally
+            {
+                linkedCts.Dispose();
+            }
+        }
+
+        private async UniTask AnimateClearAsyncInternal(IReadOnlyList<GridPosition> positions, float duration, int maxPerFrame, CancellationToken ct)
+        {
             int processed = 0;
             foreach (var pos in positions)
             {
@@ -295,12 +473,20 @@ namespace Match3.App.Demo
 
                 var go = view.ItemGo;
                 var renderer = view.ItemRenderer;
+                if (go == null || renderer == null)
+                {
+                    continue;
+                }
                 var startScale = go.transform.localScale;
                 var startColor = renderer.color;
                 float t = 0f;
                 while (t < duration)
                 {
                     ct.ThrowIfCancellationRequested();
+                    if (go == null || renderer == null)
+                    {
+                        break;
+                    }
                     t += Time.deltaTime;
                     float p = duration <= 0 ? 1f : Mathf.Clamp01(t / duration);
                     go.transform.localScale = Vector3.Lerp(startScale, Vector3.zero, p);
@@ -314,7 +500,10 @@ namespace Match3.App.Demo
                 view.ItemRenderer = null;
                 _slots[pos] = view;
 
-                _itemPool.Recycle(go);
+                if (go != null)
+                {
+                    _itemPool.Recycle(go);
+                }
 
                 processed++;
                 if (maxPerFrame > 0 && processed >= maxPerFrame)
@@ -326,6 +515,19 @@ namespace Match3.App.Demo
         }
 
         public async UniTask AnimateMovesAsync(IReadOnlyList<(GridPosition from, GridPosition to)> moves, float duration, int maxPerFrame, CancellationToken ct = default)
+        {
+            var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, this.GetCancellationTokenOnDestroy());
+            try
+            {
+                await AnimateMovesAsyncInternal(moves, duration, maxPerFrame, linkedCts.Token);
+            }
+            finally
+            {
+                linkedCts.Dispose();
+            }
+        }
+
+        private async UniTask AnimateMovesAsyncInternal(IReadOnlyList<(GridPosition from, GridPosition to)> moves, float duration, int maxPerFrame, CancellationToken ct)
         {
             int processed = 0;
             foreach (var move in moves)
@@ -344,6 +546,10 @@ namespace Match3.App.Demo
 
                 var go = fromView.ItemGo;
                 var renderer = fromView.ItemRenderer;
+                if (go == null || renderer == null)
+                {
+                    continue;
+                }
 
                 var start = go.transform.position;
                 var end = toView.AnchorWorld;
@@ -352,10 +558,18 @@ namespace Match3.App.Demo
                 while (t < duration)
                 {
                     ct.ThrowIfCancellationRequested();
+                    if (go == null)
+                    {
+                        return;
+                    }
                     t += Time.deltaTime;
                     float p = duration <= 0 ? 1f : Mathf.Clamp01(t / duration);
                     go.transform.position = Vector3.Lerp(start, end, p);
                     await UniTask.Yield(PlayerLoopTiming.Update, ct);
+                }
+                if (go == null)
+                {
+                    return;
                 }
                 go.transform.position = end;
 
@@ -377,6 +591,19 @@ namespace Match3.App.Demo
 
         public async UniTask AnimateSpawnAsync(IReadOnlyList<GridPosition> positions, Func<GridPosition, int> itemIdProvider, float duration, float spawnHeight, int maxPerFrame, CancellationToken ct = default)
         {
+            var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, this.GetCancellationTokenOnDestroy());
+            try
+            {
+                await AnimateSpawnAsyncInternal(positions, itemIdProvider, duration, spawnHeight, maxPerFrame, linkedCts.Token);
+            }
+            finally
+            {
+                linkedCts.Dispose();
+            }
+        }
+
+        private async UniTask AnimateSpawnAsyncInternal(IReadOnlyList<GridPosition> positions, Func<GridPosition, int> itemIdProvider, float duration, float spawnHeight, int maxPerFrame, CancellationToken ct)
+        {
             int processed = 0;
             foreach (var pos in positions)
             {
@@ -392,11 +619,20 @@ namespace Match3.App.Demo
                 }
 
                 var go = _itemPool.Allocate();
+                if (go == null)
+                {
+                    continue;
+                }
                 go.SetActive(true);
                 go.transform.SetParent(_root, true);
                 go.transform.localScale = Vector3.one;
 
                 var renderer = go.GetComponent<SpriteRenderer>();
+                if (renderer == null)
+                {
+                    _itemPool.Recycle(go);
+                    continue;
+                }
                 int itemId = itemIdProvider(pos);
                 renderer.color = ItemIdToColor(itemId, 1f);
                 renderer.sortingOrder = 1;
@@ -409,10 +645,18 @@ namespace Match3.App.Demo
                 while (t < duration)
                 {
                     ct.ThrowIfCancellationRequested();
+                    if (go == null)
+                    {
+                        return;
+                    }
                     t += Time.deltaTime;
                     float p = duration <= 0 ? 1f : Mathf.Clamp01(t / duration);
                     go.transform.position = Vector3.Lerp(start, end, p);
                     await UniTask.Yield(PlayerLoopTiming.Update, ct);
+                }
+                if (go == null)
+                {
+                    return;
                 }
                 go.transform.position = end;
 
@@ -492,13 +736,16 @@ namespace Match3.App.Demo
 
         private Color ItemIdToColor(int itemId, float alpha)
         {
-            if (itemId <= 0 || _palette == null || _palette.Length == 0)
+            if (itemId <= 0 || _itemColors == null)
             {
                 return new Color(1f, 1f, 1f, alpha);
             }
 
-            int idx = (itemId - 1) % _palette.Length;
-            var c = _palette[idx];
+            if (_itemColors.TryGetValue(itemId, out var c) == false)
+            {
+                return new Color(1f, 0f, 1f, alpha);
+            }
+
             c.a = alpha;
             return c;
         }
@@ -562,6 +809,41 @@ namespace Match3.App.Demo
             tex.SetPixel(0, 0, Color.white);
             tex.Apply(false, true);
             return Sprite.Create(tex, new Rect(0, 0, 1, 1), new Vector2(0.5f, 0.5f), 1f);
+        }
+
+        private static Dictionary<int, Color> BuildItemColors(ItemVisual[] itemVisuals)
+        {
+            var map = new Dictionary<int, Color>();
+            if (itemVisuals == null)
+            {
+                return map;
+            }
+
+            for (int i = 0; i < itemVisuals.Length; i++)
+            {
+                int id = itemVisuals[i].itemId;
+                if (id <= 0)
+                {
+                    continue;
+                }
+
+                map[id] = itemVisuals[i].color;
+            }
+
+            if (map.Count == 0)
+            {
+                map[1] = Color.white;
+            }
+
+            return map;
+        }
+
+        private static bool ColorsClose(Color a, Color b)
+        {
+            return Mathf.Abs(a.r - b.r) < 0.01f &&
+                   Mathf.Abs(a.g - b.g) < 0.01f &&
+                   Mathf.Abs(a.b - b.b) < 0.01f &&
+                   Mathf.Abs(a.a - b.a) < 0.01f;
         }
     }
 }
