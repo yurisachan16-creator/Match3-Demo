@@ -13,6 +13,7 @@ namespace Match3.App.Demo
     public class GameController : MonoBehaviour
     {
         private MyMatch3Game _game;
+        private bool _busy;
         
         [SerializeField] private int rows = 8;
         [SerializeField] private int cols = 8;
@@ -29,8 +30,20 @@ namespace Match3.App.Demo
         [SerializeField] private bool autoFitCamera = true;
         [SerializeField] private Transform boardRoot;
         [SerializeField] private GameBoardView boardView;
+        [SerializeField] private BoardInputController inputController;
+        [SerializeField] private FpsMonitor fpsMonitor;
         [SerializeField] private Vector2Int debugSwapA = new Vector2Int(0, 0);
         [SerializeField] private Vector2Int debugSwapB = new Vector2Int(0, 1);
+
+        [SerializeField] private float swapDuration = 0.12f;
+        [SerializeField] private float clearDuration = 0.12f;
+        [SerializeField] private float fallDuration = 0.12f;
+        [SerializeField] private float spawnDuration = 0.12f;
+        [SerializeField] private float spawnHeight = 6f;
+        [SerializeField] private int maxPerFrame = 32;
+        [SerializeField] private int maxChains = 10;
+
+        public bool IsBusy => _busy;
 
         void Start()
         {
@@ -50,15 +63,37 @@ namespace Match3.App.Demo
                 }
             }
 
+            if (inputController == null)
+            {
+                inputController = GetComponent<BoardInputController>();
+                if (inputController == null)
+                {
+                    inputController = gameObject.AddComponent<BoardInputController>();
+                }
+            }
+
+            if (fpsMonitor == null)
+            {
+                fpsMonitor = GetComponent<FpsMonitor>();
+                if (fpsMonitor == null)
+                {
+                    fpsMonitor = gameObject.AddComponent<FpsMonitor>();
+                }
+            }
+
+            var solver = new GameBoardSolver<GameSlot>(new ISequenceDetector<GameSlot>[]
+            {
+                new HorizontalLineDetector<GameSlot>(),
+                new VerticalLineDetector<GameSlot>()
+            }, new ISpecialItemDetector<GameSlot>[0]);
+
+            var itemSwapper = new MyItemSwapper(boardView, swapDuration);
+
             var config = new GameConfig<GameSlot>
             {
                 GameBoardDataProvider = new MyGameBoardDataProvider(rows, cols),
-                GameBoardSolver = new GameBoardSolver<GameSlot>(new ISequenceDetector<GameSlot>[]
-                {
-                    new HorizontalLineDetector<GameSlot>(),
-                    new VerticalLineDetector<GameSlot>()
-                }, new ISpecialItemDetector<GameSlot>[0]),
-                ItemSwapper = new MyItemSwapper(),
+                GameBoardSolver = solver,
+                ItemSwapper = itemSwapper,
                 LevelGoalsProvider = new MyLevelGoalsProvider(),
                 SolvedSequencesConsumers = new ISolvedSequencesConsumer<GameSlot>[] { }
             };
@@ -68,7 +103,7 @@ namespace Match3.App.Demo
             _game.InitGameLevel(0);
 
             var itemsPool = new ArrayItemsPool(itemIds);
-            var fillStrategy = new SimpleFillStrategy(itemsPool);
+            var fillStrategy = new GravityFillStrategy(itemsPool, boardView, solver, clearDuration, fallDuration, spawnDuration, spawnHeight, maxPerFrame, maxChains);
             _game.SetGameBoardFillStrategy(fillStrategy);
 
             boardView.Build(_game.Board, tileSize, palette, boardRoot, autoFitCamera);
@@ -80,15 +115,30 @@ namespace Match3.App.Demo
 
         public void TrySwap(int r1, int c1, int r2, int c2)
         {
-            if (_game != null)
-            {
-                _game.SwapItemsAsync(new GridPosition(r1, c1), new GridPosition(r2, c2)).Forget();
-            }
+            TrySwapAsync(new GridPosition(r1, c1), new GridPosition(r2, c2)).Forget(Debug.LogException);
         }
         
         public void DebugSwap()
         {
             TrySwap(debugSwapA.x, debugSwapA.y, debugSwapB.x, debugSwapB.y);
+        }
+
+        private async UniTask TrySwapAsync(GridPosition a, GridPosition b)
+        {
+            if (_game == null || _busy)
+            {
+                return;
+            }
+
+            _busy = true;
+            try
+            {
+                await _game.SwapItemsAsync(a, b);
+            }
+            finally
+            {
+                _busy = false;
+            }
         }
 
         public void RebuildBoard()
@@ -131,15 +181,19 @@ namespace Match3.App.Demo
 
             _game?.ResetGameBoard();
 
+            var solver = new GameBoardSolver<GameSlot>(new ISequenceDetector<GameSlot>[]
+            {
+                new HorizontalLineDetector<GameSlot>(),
+                new VerticalLineDetector<GameSlot>()
+            }, new ISpecialItemDetector<GameSlot>[0]);
+
+            var itemSwapper = new MyItemSwapper(boardView, swapDuration);
+
             var config = new GameConfig<GameSlot>
             {
                 GameBoardDataProvider = new MyGameBoardDataProvider(rows, cols),
-                GameBoardSolver = new GameBoardSolver<GameSlot>(new ISequenceDetector<GameSlot>[]
-                {
-                    new HorizontalLineDetector<GameSlot>(),
-                    new VerticalLineDetector<GameSlot>()
-                }, new ISpecialItemDetector<GameSlot>[0]),
-                ItemSwapper = new MyItemSwapper(),
+                GameBoardSolver = solver,
+                ItemSwapper = itemSwapper,
                 LevelGoalsProvider = new MyLevelGoalsProvider(),
                 SolvedSequencesConsumers = new ISolvedSequencesConsumer<GameSlot>[] { }
             };
@@ -148,11 +202,74 @@ namespace Match3.App.Demo
             _game.InitGameLevel(0);
 
             var itemsPool = new ArrayItemsPool(itemIds);
-            var fillStrategy = new SimpleFillStrategy(itemsPool);
+            var fillStrategy = new GravityFillStrategy(itemsPool, boardView, solver, clearDuration, fallDuration, spawnDuration, spawnHeight, maxPerFrame, maxChains);
             _game.SetGameBoardFillStrategy(fillStrategy);
 
             boardView.Build(_game.Board, tileSize, palette, boardRoot, autoFitCamera);
             await _game.StartAsync();
+        }
+
+        public void SetBusy(bool busy)
+        {
+            _busy = busy;
+        }
+
+        public bool HasItemAt(GridPosition pos)
+        {
+            if (_game == null)
+            {
+                return false;
+            }
+
+            if (_game.Board.IsPositionOnBoard(pos) == false)
+            {
+                return false;
+            }
+
+            return _game.Board[pos].HasItem;
+        }
+
+        public bool CanSwap(GridPosition a, GridPosition b)
+        {
+            if (_game == null)
+            {
+                return false;
+            }
+
+            if (_game.Board.IsPositionOnBoard(a) == false || _game.Board.IsPositionOnBoard(b) == false)
+            {
+                return false;
+            }
+
+            int manhattan = Mathf.Abs(a.RowIndex - b.RowIndex) + Mathf.Abs(a.ColumnIndex - b.ColumnIndex);
+            if (manhattan != 1)
+            {
+                return false;
+            }
+
+            var sa = _game.Board[a];
+            var sb = _game.Board[b];
+            if (sa.HasItem == false || sb.HasItem == false)
+            {
+                return false;
+            }
+
+            if (sa.IsMovable == false || sb.IsMovable == false)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        public UniTask SwapAsync(GridPosition a, GridPosition b, CancellationToken ct = default)
+        {
+            if (_game == null)
+            {
+                return UniTask.CompletedTask;
+            }
+
+            return _game.SwapItemsAsync(a, b, ct);
         }
     }
 
@@ -211,21 +328,33 @@ namespace Match3.App.Demo
 
     public class MyItemSwapper : IItemSwapper<GameSlot>
     {
+        private readonly GameBoardView _boardView;
+        private readonly float _swapDuration;
+
+        public MyItemSwapper(GameBoardView boardView, float swapDuration)
+        {
+            _boardView = boardView;
+            _swapDuration = swapDuration;
+        }
+
         public async UniTask SwapItemsAsync(GameSlot gridSlot1, GameSlot gridSlot2, CancellationToken cancellationToken = default)
         {
-            Debug.Log($"Swapping {gridSlot1.GridPosition} (Item: {gridSlot1.ItemId}) <-> {gridSlot2.GridPosition} (Item: {gridSlot2.ItemId})");
-            
-            // Swap Data
+            if (_boardView != null)
+            {
+                await _boardView.AnimateSwapAsync(gridSlot1.GridPosition, gridSlot2.GridPosition, _swapDuration, cancellationToken);
+            }
+
+            _boardView?.BeginBatch();
             int tempId = gridSlot1.ItemId;
             bool tempHas = gridSlot1.HasItem;
-            
+
             if (gridSlot2.HasItem) gridSlot1.SetItem(gridSlot2.ItemId);
             else gridSlot1.Clear();
-            
+
             if (tempHas) gridSlot2.SetItem(tempId);
             else gridSlot2.Clear();
-            
-            await UniTask.Yield();
+
+            _boardView?.EndBatch(refreshDirty: true);
         }
     }
 
